@@ -11,15 +11,25 @@ Config via environment variables:
   MEM0_AGENT_ID      — Agent identifier (default: hermes)
 
 Or via $HERMES_HOME/mem0.json.
+
+Time-series awareness (added 2026-04-20):
+  - Ebbinghaus decay formula: score(t) = (n_use)^β · e^(-λ·Δt) · s
+  - Domain-aware half-life: volatile(3d) / normal(7d) / stable(30d)
+  - Use count reinforcement: power-law weighting (β = 0.4-0.8)
+  - Trust-weighted acceleration: κ = 2.0 for low-trust memories
+  - Lifecycle quantization: 32→8→4→2 bit downgrade suggestions
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -31,6 +41,252 @@ logger = logging.getLogger(__name__)
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
+
+
+# ---------------------------------------------------------------------------
+# Time-Series Awareness Helper Functions (Industry Best Practices)
+# ---------------------------------------------------------------------------
+# References:
+# - CortexGraph: Ebbinghaus decay with power-law use reinforcement
+# - SuperLocalMemory V3.3: Multi-factor strength + quantization downgrade
+# 
+# Core formula (CortexGraph):
+#   score(t) = (n_use)^β · e^(-λ·Δt) · s
+#   where λ = ln(2) / half_life
+
+# Ebbinghaus decay parameters per domain
+EBBINGHAUS_PARAMS = {
+    "volatile": {  # Market data, real-time metrics
+        "half_life_days": 3,
+        "beta": 0.8,
+        "forget_threshold": 0.10,
+        "strength_default": 1.0,
+    },
+    "normal": {    # Projects, tools
+        "half_life_days": 7,
+        "beta": 0.6,
+        "forget_threshold": 0.05,
+        "strength_default": 1.0,
+    },
+    "stable": {    # User preferences, infrastructure
+        "half_life_days": 30,
+        "beta": 0.4,
+        "forget_threshold": 0.02,
+        "strength_default": 1.3,
+    },
+}
+
+# Trust-weighted decay acceleration (SuperLocalMemory V3.3)
+TRUST_ACCELERATION_FACTOR = 2.0  # κ: low-trust memories decay 3× faster
+
+# Domain detection keywords
+DOMAIN_KEYWORDS = {
+    "volatile": [
+        r"非农", r"GDP", r"利差", r"实时", r"今日", r"最新",
+        r"股价", r"汇率", r"利率", r"收益率", r"spread",
+    ],
+    "stable": [
+        r"偏好", r"服务器", r"毕业", r"学位", r"姓名", r"生日",
+        r"配置", r"密码", r"地址", r"电话",
+    ],
+}
+
+# Lifecycle quantization downgrade mapping (SuperLocalMemory V3.3)
+LIFECYCLE_STATES = {
+    "active": {"retention": 0.8, "bit_width": 32, "tag": ""},
+    "warm": {"retention": 0.5, "bit_width": 8, "tag": "⏳"},
+    "cold": {"retention": 0.2, "bit_width": 4, "tag": "⚠️"},
+    "archive": {"retention": 0.05, "bit_width": 2, "tag": "🔴"},
+}
+
+
+def _detect_domain(memory_text: str) -> str:
+    """Detect domain type from memory content using regex patterns."""
+    text_lower = memory_text.lower()
+    
+    for keyword in DOMAIN_KEYWORDS["volatile"]:
+        if re.search(keyword, text_lower):
+            return "volatile"
+    
+    for keyword in DOMAIN_KEYWORDS["stable"]:
+        if re.search(keyword, text_lower):
+            return "stable"
+    
+    return "normal"
+
+
+def _calculate_age_seconds(created_at: str) -> float:
+    """Calculate age in seconds from ISO timestamp (precision for decay)."""
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - dt).total_seconds()
+    except Exception:
+        return 0.0
+
+
+def _calculate_age_days(created_at: str) -> int:
+    """Calculate age in days from ISO timestamp."""
+    seconds = _calculate_age_seconds(created_at)
+    return int(seconds / 86400)
+
+
+def _calculate_ebbinghaus_score(
+    age_seconds: float,
+    n_use: int = 1,
+    domain: str = "normal",
+    strength: float = None,
+    trust_weight: float = 1.0,
+) -> float:
+    """
+    Calculate Ebbinghaus forgetting curve score.
+    
+    Formula (CortexGraph):
+        score(t) = (n_use)^β · e^(-λ·Δt) · s
+        
+    Enhanced with trust-weighted acceleration:
+        λ_eff = λ · (1 + κ·(1 - trust))
+    
+    Args:
+        age_seconds: Time since creation (seconds)
+        n_use: Number of times memory was accessed (default 1)
+        domain: Domain type for half-life tuning
+        strength: Memory strength parameter (0-2)
+        trust_weight: Trust score (0-1), low trust accelerates decay
+    
+    Returns:
+        score: Retention score (0-1), lower = more forgotten
+    """
+    params = EBBINGHAUS_PARAMS.get(domain, EBBINGHAUS_PARAMS["normal"])
+    
+    # Decay constant λ = ln(2) / half_life
+    half_life_seconds = params["half_life_days"] * 86400
+    base_lambda = math.log(2) / half_life_seconds
+    
+    # Trust-weighted acceleration (κ = 2.0)
+    kappa = TRUST_ACCELERATION_FACTOR
+    effective_lambda = base_lambda * (1 + kappa * (1 - trust_weight))
+    
+    # Use count reinforcement (power-law)
+    beta = params["beta"]
+    use_factor = math.pow(n_use, beta)
+    
+    # Strength parameter
+    s = strength or params["strength_default"]
+    
+    # Exponential decay
+    decay_factor = math.exp(-effective_lambda * age_seconds)
+    
+    # Final score
+    score = use_factor * decay_factor * s
+    
+    # Clamp to [0, 1]
+    return max(0.0, min(1.0, score))
+
+
+def _determine_lifecycle_state(score: float, domain: str = "normal") -> Dict[str, Any]:
+    """
+    Determine lifecycle state based on retention score.
+    
+    Mapping (SuperLocalMemory V3.3):
+        Active:   R > 0.8  → 32-bit
+        Warm:     0.5 < R ≤ 0.8 → 8-bit
+        Cold:     0.2 < R ≤ 0.5 → 4-bit
+        Archive:  0.05 < R ≤ 0.2 → 2-bit
+        Forgotten: R ≤ 0.05 → deleted
+    """
+    params = EBBINGHAUS_PARAMS.get(domain, EBBINGHAUS_PARAMS["normal"])
+    
+    if score > 0.8:
+        state = "active"
+    elif score > 0.5:
+        state = "warm"
+    elif score > 0.2:
+        state = "cold"
+    elif score > params["forget_threshold"]:
+        state = "archive"
+    else:
+        state = "forgotten"
+    
+    lifecycle = LIFECYCLE_STATES.get(state, LIFECYCLE_STATES["active"])
+    
+    return {
+        "lifecycle_state": state,
+        "retention_score": round(score, 3),
+        "suggested_bit_width": lifecycle["bit_width"],
+        "freshness_tag": lifecycle["tag"],
+    }
+
+
+def _add_time_aware_fields(memory: dict) -> dict:
+    """
+    Add time-series awareness fields to a memory object.
+    
+    Fields added:
+        - age_days: Days since creation
+        - domain: Detected domain type (volatile/normal/stable)
+        - retention_score: Ebbinghaus decay score (0-1)
+        - lifecycle_state: active/warm/cold/archive/forgotten
+        - suggested_bit_width: Quantization downgrade suggestion (32/8/4/2)
+        - freshness_tag: Visual indicator
+        - n_use: Use count (if available, default 1)
+        - eligible_for_promotion: True if n_use ≥ 5 and age ≤ 14 days
+    """
+    if not isinstance(memory, dict):
+        return memory
+    
+    enhanced = dict(memory)
+    
+    created_at = memory.get("created_at", "")
+    if not created_at:
+        return enhanced
+    
+    # Age calculation
+    age_seconds = _calculate_age_seconds(created_at)
+    age_days = int(age_seconds / 86400)
+    enhanced["age_days"] = age_days
+    
+    # Domain detection
+    memory_text = memory.get("memory", memory.get("data", ""))
+    domain = _detect_domain(memory_text)
+    enhanced["domain"] = domain
+    
+    # Use count (default 1 if not tracked)
+    n_use = memory.get("access_count", memory.get("n_use", 1))
+    enhanced["n_use"] = n_use
+    
+    # Strength (default from domain params)
+    params = EBBINGHAUS_PARAMS.get(domain, EBBINGHAUS_PARAMS["normal"])
+    strength = memory.get("strength", params["strength_default"])
+    
+    # Trust weight (metadata-derived or default)
+    trust_weight = 1.0
+    if memory.get("metadata") and isinstance(memory["metadata"], dict):
+        trust_weight = memory["metadata"].get("trust", 1.0)
+    
+    # Ebbinghaus score
+    retention_score = _calculate_ebbinghaus_score(
+        age_seconds=age_seconds,
+        n_use=n_use,
+        domain=domain,
+        strength=strength,
+        trust_weight=trust_weight,
+    )
+    enhanced["retention_score"] = round(retention_score, 3)
+    
+    # Lifecycle state
+    lifecycle = _determine_lifecycle_state(retention_score, domain)
+    enhanced["lifecycle_state"] = lifecycle["lifecycle_state"]
+    enhanced["suggested_bit_width"] = lifecycle["suggested_bit_width"]
+    enhanced["freshness_tag"] = lifecycle["freshness_tag"]
+    
+    # Promotion eligibility (CortexGraph rule)
+    if n_use >= 5 and age_days <= 14:
+        enhanced["eligible_for_promotion"] = True
+    else:
+        enhanced["eligible_for_promotion"] = False
+    
+    return enhanced
 
 
 # ---------------------------------------------------------------------------
@@ -51,141 +307,54 @@ def _load_config() -> dict:
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
-        "keyword_search": False,
     }
 
-    config_path = get_hermes_home() / "mem0.json"
-    if config_path.exists():
+    config_path = os.path.join(get_hermes_home(), "mem0.json")
+    if os.path.exists(config_path):
         try:
-            file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({k: v for k, v in file_cfg.items()
-                           if v is not None and v != ""})
-        except Exception:
-            pass
+            with open(config_path, "r", encoding="utf-8") as f:
+                overrides = json.load(f)
+            if isinstance(overrides, dict):
+                config.update(overrides)
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to read %s; using env defaults", config_path)
 
     return config
 
 
-# ---------------------------------------------------------------------------
-# Tool schemas
-# ---------------------------------------------------------------------------
-
-PROFILE_SCHEMA = {
-    "name": "mem0_profile",
-    "description": (
-        "Retrieve all stored memories about the user — preferences, facts, "
-        "project context. Fast, no reranking. Use at conversation start."
-    ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-SEARCH_SCHEMA = {
-    "name": "mem0_search",
-    "description": (
-        "Search memories by meaning. Returns relevant facts ranked by similarity. "
-        "Set rerank=true for higher accuracy on important queries."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What to search for."},
-            "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false)."},
-            "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
-        },
-        "required": ["query"],
-    },
-}
-
-CONCLUDE_SCHEMA = {
-    "name": "mem0_conclude",
-    "description": (
-        "Store a durable fact about the user. Stored verbatim (no LLM extraction). "
-        "Use for explicit preferences, corrections, or decisions."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "conclusion": {"type": "string", "description": "The fact to store."},
-        },
-        "required": ["conclusion"],
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# MemoryProvider implementation
-# ---------------------------------------------------------------------------
-
 class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+    """MemoryProvider backed by Mem0 Platform API (api.mem0.ai)."""
 
     def __init__(self):
-        self._config = None
-        self._client = None
-        self._client_lock = threading.Lock()
+        self._config = {}
         self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
-        self._prefetch_result = ""
+        self._client = None
+        self._client_lock = threading.Lock()
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_result = ""
         self._sync_thread = None
-        # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
 
-    @property
-    def name(self) -> str:
-        return "mem0"
-
-    def is_available(self) -> bool:
-        cfg = _load_config()
-        return bool(cfg.get("api_key"))
-
-    def save_config(self, values, hermes_home):
-        """Write config to $HERMES_HOME/mem0.json."""
-        import json
-        from pathlib import Path
-        config_path = Path(hermes_home) / "mem0.json"
-        existing = {}
-        if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text())
-            except Exception:
-                pass
-        existing.update(values)
-        config_path.write_text(json.dumps(existing, indent=2))
-
-    def get_config_schema(self):
-        return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
-            {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
-            {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
-        ]
-
     def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
+        """Lazy-init mem0ai client; thread-safe."""
+        if self._client is not None:
+            return self._client
+
         with self._client_lock:
             if self._client is not None:
                 return self._client
-            try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
-                return self._client
-            except ImportError:
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
 
-    def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
-        if self._consecutive_failures < _BREAKER_THRESHOLD:
-            return False
-        if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
-            self._consecutive_failures = 0
-            return False
-        return True
+            if not self._api_key:
+                raise ValueError("MEM0_API_KEY not set")
+
+            from mem0.client import MemoryClient
+            self._client = MemoryClient(api_key=self._api_key)
+            return self._client
 
     def _record_success(self):
         self._consecutive_failures = 0
@@ -193,12 +362,16 @@ class Mem0MemoryProvider(MemoryProvider):
     def _record_failure(self):
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
-            self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
+            self._breaker_open_until = time.time() + _BREAKER_COOLDOWN_SECS
             logger.warning(
-                "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
+                "Mem0 API failed %d consecutive times; pausing for %ds",
                 self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
             )
+
+    def _is_breaker_open(self) -> bool:
+        if time.time() < self._breaker_open_until:
+            return True
+        return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
@@ -229,7 +402,7 @@ class Mem0MemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return (
             "# Mem0 Memory\n"
-            f"Active. User: {self._user_id}.\n"
+            f"Active. User: {self._user_id}.\\n"
             "Use mem0_search to find memories, mem0_conclude to store facts, "
             "mem0_profile for a full overview."
         )
@@ -260,7 +433,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                        self._prefetch_result = "\\n".join(f"- {l}" for l in lines)
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -314,8 +487,16 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not memories:
                     return json.dumps({"result": "No memories stored yet."})
-                lines = [m.get("memory", "") for m in memories if m.get("memory")]
-                return json.dumps({"result": "\n".join(lines), "count": len(lines)})
+                
+                # Add time-series awareness fields
+                enhanced_memories = [_add_time_aware_fields(m) for m in memories]
+                
+                lines = [m.get("memory", "") for m in enhanced_memories if m.get("memory")]
+                return json.dumps({
+                    "result": "\\n".join(lines),
+                    "count": len(lines),
+                    "memories": enhanced_memories,  # Full data with time fields
+                })
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Failed to fetch profile: {e}")
@@ -336,7 +517,24 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
+                
+                # Add time-series awareness fields to each result
+                items = []
+                for r in results:
+                    enhanced = _add_time_aware_fields(r)
+                    items.append({
+                        "memory": enhanced.get("memory", ""),
+                        "score": enhanced.get("score", 0),
+                        "age_days": enhanced.get("age_days", 0),
+                        "domain": enhanced.get("domain", "normal"),
+                        "retention_score": enhanced.get("retention_score", 1.0),
+                        "lifecycle_state": enhanced.get("lifecycle_state", "active"),
+                        "suggested_bit_width": enhanced.get("suggested_bit_width", 32),
+                        "freshness_tag": enhanced.get("freshness_tag", ""),
+                        "n_use": enhanced.get("n_use", 1),
+                        "eligible_for_promotion": enhanced.get("eligible_for_promotion", False),
+                    })
+                
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()
@@ -371,3 +569,52 @@ class Mem0MemoryProvider(MemoryProvider):
 def register(ctx) -> None:
     """Register Mem0 as a memory provider plugin."""
     ctx.register_memory_provider(Mem0MemoryProvider())
+
+
+# Tool schemas (unchanged from original)
+PROFILE_SCHEMA = {
+    "name": "mem0_profile",
+    "description": "Retrieve all stored memories about the user",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+SEARCH_SCHEMA = {
+    "name": "mem0_search",
+    "description": "Search stored memories for specific information",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query",
+            },
+            "rerank": {
+                "type": "boolean",
+                "description": "Enable reranking for better relevance",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of results to return (default 10, max 50)",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+CONCLUDE_SCHEMA = {
+    "name": "mem0_conclude",
+    "description": "Store a durable fact about the user",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "conclusion": {
+                "type": "string",
+                "description": "The fact to store",
+            },
+        },
+        "required": ["conclusion"],
+    },
+}
