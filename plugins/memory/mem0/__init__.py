@@ -34,6 +34,172 @@ _BREAKER_COOLDOWN_SECS = 120
 
 
 # ---------------------------------------------------------------------------
+# Time-Series Awareness — Ebbinghaus Decay (Industry Best Practices)
+# ---------------------------------------------------------------------------
+# References:
+#   - CortexGraph: Ebbinghaus decay with power-law use reinforcement
+#   - SuperLocalMemory V3.3: Multi-factor strength + quantization downgrade
+#
+# Core formula (CortexGraph):
+#   score(t) = (n_use)^β · e^(-λ·Δt) · s
+#   where λ = ln(2) / half_life
+
+_EBBINGHAUS_PARAMS = {
+    "volatile": {  # Market data, real-time metrics
+        "half_life_days": 3,
+        "beta": 0.8,
+        "forget_threshold": 0.10,
+        "strength_default": 1.0,
+    },
+    "normal": {    # Projects, tools, general facts
+        "half_life_days": 7,
+        "beta": 0.6,
+        "forget_threshold": 0.05,
+        "strength_default": 1.0,
+    },
+    "stable": {    # User preferences, infrastructure
+        "half_life_days": 30,
+        "beta": 0.4,
+        "forget_threshold": 0.02,
+        "strength_default": 1.3,
+    },
+}
+
+_TRUST_ACCELERATION_FACTOR = 2.0  # κ: low-trust memories decay faster
+
+_DOMAIN_KEYWORDS = {
+    "volatile": [
+        r"非农", r"GDP", r"利差", r"实时", r"今日", r"最新",
+        r"股价", r"汇率", r"利率", r"收益率", r"spread",
+    ],
+    "stable": [
+        r"偏好", r"服务器", r"毕业", r"学位", r"姓名", r"生日",
+        r"配置", r"密码", r"地址", r"电话",
+    ],
+}
+
+_LIFECYCLE_STATES = {
+    "active":  {"retention": 0.8,  "bit_width": 32, "tag": ""},
+    "warm":    {"retention": 0.5,  "bit_width": 8,  "tag": "⏳"},
+    "cold":    {"retention": 0.2,  "bit_width": 4,  "tag": "⚠️"},
+    "archive": {"retention": 0.05, "bit_width": 2,  "tag": "🔴"},
+}
+
+
+def _detect_domain(memory_text: str) -> str:
+    """Detect domain type from memory content using keyword patterns."""
+    if not memory_text:
+        return "normal"
+    text_lower = memory_text.lower()
+    for kw in _DOMAIN_KEYWORDS["volatile"]:
+        if re.search(kw, text_lower):
+            return "volatile"
+    for kw in _DOMAIN_KEYWORDS["stable"]:
+        if re.search(kw, text_lower):
+            return "stable"
+    return "normal"
+
+
+def _calculate_age_seconds(created_at: str) -> float:
+    """Calculate age in seconds from an ISO-8601 timestamp."""
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return 0.0
+
+
+def _calculate_ebbinghaus_score(
+    age_seconds: float,
+    n_use: int = 1,
+    domain: str = "normal",
+    strength: float | None = None,
+    trust_weight: float = 1.0,
+) -> float:
+    """Ebbinghaus forgetting-curve score.
+
+    Formula (CortexGraph):
+        score(t) = (n_use)^β · e^(-λ·Δt) · s
+    Enhanced with trust-weighted acceleration:
+        λ_eff = λ · (1 + κ·(1 - trust))
+    """
+    params = _EBBINGHAUS_PARAMS.get(domain, _EBBINGHAUS_PARAMS["normal"])
+    half_life_secs = params["half_life_days"] * 86400
+    base_lambda = math.log(2) / half_life_secs
+    effective_lambda = base_lambda * (1 + _TRUST_ACCELERATION_FACTOR * (1 - trust_weight))
+    use_factor = math.pow(n_use, params["beta"])
+    s = strength if strength is not None else params["strength_default"]
+    score = use_factor * math.exp(-effective_lambda * age_seconds) * s
+    return max(0.0, min(1.0, score))
+
+
+def _determine_lifecycle(score: float, domain: str = "normal") -> dict:
+    """Map retention score to lifecycle state + bit-width suggestion."""
+    params = _EBBINGHAUS_PARAMS.get(domain, _EBBINGHAUS_PARAMS["normal"])
+    if score > 0.8:
+        state = "active"
+    elif score > 0.5:
+        state = "warm"
+    elif score > 0.2:
+        state = "cold"
+    elif score > params["forget_threshold"]:
+        state = "archive"
+    else:
+        state = "forgotten"
+    lc = _LIFECYCLE_STATES.get(state, _LIFECYCLE_STATES["active"])
+    return {
+        "lifecycle_state": state,
+        "retention_score": round(score, 3),
+        "suggested_bit_width": lc["bit_width"],
+        "freshness_tag": lc["tag"],
+    }
+
+
+def _add_time_aware_fields(memory: dict) -> dict:
+    """Enrich a memory dict with Ebbinghaus time-series fields.
+
+    Adds: age_days, domain, retention_score, lifecycle_state,
+          suggested_bit_width, freshness_tag, n_use, eligible_for_promotion.
+    """
+    if not isinstance(memory, dict):
+        return memory
+    enhanced = dict(memory)
+    created_at = memory.get("created_at", "")
+    if not created_at:
+        return enhanced
+
+    age_secs = _calculate_age_seconds(created_at)
+    age_days = int(age_secs / 86400)
+    enhanced["age_days"] = age_days
+
+    memory_text = memory.get("memory", memory.get("data", ""))
+    domain = _detect_domain(memory_text)
+    enhanced["domain"] = domain
+
+    n_use = memory.get("access_count", memory.get("n_use", 1))
+    enhanced["n_use"] = n_use
+
+    params = _EBBINGHAUS_PARAMS.get(domain, _EBBINGHAUS_PARAMS["normal"])
+    strength = memory.get("strength", params["strength_default"])
+    trust_weight = 1.0
+    meta = memory.get("metadata")
+    if isinstance(meta, dict):
+        trust_weight = meta.get("trust", 1.0)
+
+    retention = _calculate_ebbinghaus_score(
+        age_seconds=age_secs, n_use=n_use, domain=domain,
+        strength=strength, trust_weight=trust_weight,
+    )
+    enhanced["retention_score"] = round(retention, 3)
+
+    lc = _determine_lifecycle(retention, domain)
+    enhanced["lifecycle_state"] = lc["lifecycle_state"]
+    enhanced["suggested_bit_width"] = lc["suggested_bit_width"]
+    enhanced["freshness_tag"] = lc["freshness_tag"]
+    enhanced["eligible_for_promotion"] = n_use >= 5 and age_days <= 14
+
+    return enhanced
+
 # Config
 # ---------------------------------------------------------------------------
 
@@ -314,8 +480,9 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not memories:
                     return json.dumps({"result": "No memories stored yet."})
-                lines = [m.get("memory", "") for m in memories if m.get("memory")]
-                return json.dumps({"result": "\n".join(lines), "count": len(lines)})
+                enhanced = [_add_time_aware_fields(m) for m in memories]
+                lines = [m.get("memory", "") for m in enhanced if m.get("memory")]
+                return json.dumps({"result": "\n".join(lines), "count": len(lines), "memories": enhanced})
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Failed to fetch profile: {e}")
@@ -336,7 +503,21 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
+                items = []
+                for r in results:
+                    e = _add_time_aware_fields(r)
+                    items.append({
+                        "memory": e.get("memory", ""),
+                        "score": e.get("score", 0),
+                        "age_days": e.get("age_days", 0),
+                        "domain": e.get("domain", "normal"),
+                        "retention_score": e.get("retention_score", 1.0),
+                        "lifecycle_state": e.get("lifecycle_state", "active"),
+                        "suggested_bit_width": e.get("suggested_bit_width", 32),
+                        "freshness_tag": e.get("freshness_tag", ""),
+                        "n_use": e.get("n_use", 1),
+                        "eligible_for_promotion": e.get("eligible_for_promotion", False),
+                    })
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()
