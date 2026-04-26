@@ -54,6 +54,7 @@ _BREAKER_COOLDOWN_SECS = 120
 #   score(t) = (n_use)^β · e^(-λ·Δt) · s
 #   where λ = ln(2) / half_life
 
+# _EBBINGHAUS_PARAMS is a frozen configuration — override at module level if needed.
 _EBBINGHAUS_PARAMS = {
     "volatile": {  # Market data, real-time metrics
         "half_life_days": 3,
@@ -79,12 +80,12 @@ _TRUST_ACCELERATION_FACTOR = 2.0  # κ: low-trust memories decay faster
 
 _DOMAIN_KEYWORDS = {
     "volatile": [
-        r"非农", r"GDP", r"利差", r"实时", r"今日", r"最新",
-        r"股价", r"汇率", r"利率", r"收益率", r"spread",
+        r"nonfarm", r"gdp", r"spread", r"realtime", r"today", r"latest",
+        r"stock price", r"exchange rate", r"interest rate", r"yield",
     ],
     "stable": [
-        r"偏好", r"服务器", r"毕业", r"学位", r"姓名", r"生日",
-        r"配置", r"密码", r"地址", r"电话",
+        r"preference", r"server", r"graduated", r"degree", r"name", r"birthday",
+        r"config", r"password", r"address", r"phone",
     ],
 }
 
@@ -111,10 +112,15 @@ def _detect_domain(memory_text: str) -> str:
 
 
 def _calculate_age_seconds(created_at: str) -> float:
-    """Calculate age in seconds from an ISO-8601 timestamp."""
+    """Calculate age in seconds from an ISO-8601 timestamp.
+
+    Returns 0.0 for unparseable inputs or future timestamps
+    (negative age is meaningless for decay calculations).
+    """
     try:
         dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).total_seconds()
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return max(0.0, age)
     except Exception:
         return 0.0
 
@@ -132,6 +138,17 @@ def _calculate_ebbinghaus_score(
         score(t) = (n_use)^β · e^(-λ·Δt) · s
     Enhanced with trust-weighted acceleration:
         λ_eff = λ · (1 + κ·(1 - trust))
+
+    Half-life verification examples (n_use=1, trust_weight=1.0):
+        >>> # Day 7, normal domain (half_life=7d, strength=1.0): score ≈ 0.500
+        >>> round(_calculate_ebbinghaus_score(7 * 86400, domain="normal"), 3)
+        0.5
+        >>> # Day 3, volatile domain (half_life=3d, strength=1.0): score ≈ 0.500
+        >>> round(_calculate_ebbinghaus_score(3 * 86400, domain="volatile"), 3)
+        0.5
+        >>> # Day 30, stable domain (half_life=30d, strength=1.3): score ≈ 0.650
+        >>> round(_calculate_ebbinghaus_score(30 * 86400, domain="stable"), 3)
+        0.65
     """
     params = _EBBINGHAUS_PARAMS.get(domain, _EBBINGHAUS_PARAMS["normal"])
     half_life_secs = params["half_life_days"] * 86400
