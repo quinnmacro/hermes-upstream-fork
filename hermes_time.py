@@ -102,3 +102,14 @@ def now() -> datetime:
     return datetime.now().astimezone()
 
 
+
+def get_timezone_name() -> str:
+    """Return the configured IANA timezone name (e.g. 'Asia/Hong_Kong').
+    
+    Lazily resolves and caches the timezone name. Returns 'UTC' as a
+    safe default if no timezone is configured or resolution fails.
+    """
+    global _cached_tz_name, _cache_resolved
+    if not _cache_resolved:
+        _resolve_timezone()  # populates _cached_tz_name
+    return _cached_tz_name or "UTC"

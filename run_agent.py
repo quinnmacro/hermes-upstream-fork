@@ -6087,9 +6087,10 @@ class AIAgent:
             except Exception:
                 pass
 
-        from hermes_time import now as _hermes_now
+        from hermes_time import now as _hermes_now, get_timezone_name as _get_tz_name
         now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        _tz_name = _get_tz_name()
+        timestamp_line = f"Session started: {now.strftime('%A, %B %d, %Y %I:%M %p')} {_tz_name}"
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
         if self.model:
@@ -11616,7 +11617,12 @@ class AIAgent:
             "Please provide a final response summarizing what you've found and accomplished so far, "
             "without calling any more tools."
         )
-        messages.append({"role": "user", "content": summary_request})
+        # Inject current time so the agent knows when it's summarizing
+        from hermes_time import now as _maxiter_now, get_timezone_name as _maxiter_tz
+        _mi_now = _maxiter_now()
+        _mi_tz = _maxiter_tz()
+        _mi_time_ctx = "\u23f0 Current time: " + _mi_now.strftime('%A, %B %d, %Y %I:%M %p') + " " + _mi_tz
+        messages.append({"role": "user", "content": _mi_time_ctx + "\n\n" + summary_request})
 
         try:
             # Build API messages, stripping internal-only fields
@@ -12197,6 +12203,20 @@ class AIAgent:
                 _plugin_user_context = "\n\n".join(_ctx_parts)
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
+
+        # ── Per-turn time context ─────────────────────────────────────
+        # Inject current time + timezone into the user message on every
+        # turn so the agent has an accurate sense of "now".  This preserves
+        # the prompt cache prefix — the system prompt stays frozen while
+        # the dynamic timestamp goes into the per-turn user message.
+        from hermes_time import now as _hermes_now_turn, get_timezone_name as _get_tz_turn
+        _turn_now = _hermes_now_turn()
+        _turn_tz = _get_tz_turn()
+        _time_context = "\u23f0 Current time: " + _turn_now.strftime('%A, %B %d, %Y %I:%M %p') + " " + _turn_tz
+        if _plugin_user_context:
+            _plugin_user_context = _time_context + "\n\n" + _plugin_user_context
+        else:
+            _plugin_user_context = _time_context
 
         # Main conversation loop
         api_call_count = 0
